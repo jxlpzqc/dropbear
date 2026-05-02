@@ -4,12 +4,13 @@
 name: BuildTest
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches:
       - master
 jobs:
   build:
-    runs-on: ${{ matrix.os || 'ubuntu-22.04' }}
+    runs-on: ${{ matrix.os || 'ubuntu-24.04' }}
     strategy:
       matrix:
         # XXX uncomment the line below to work with act, see https://github.com/nektos/act/issues/996
@@ -23,6 +24,7 @@ jobs:
         # MULTI and NOWRITEV are passed as integers to the build
         include:
           - name: plain linux
+            upload_sizes: 1
 
           - name: multi binary
             multi: 1
@@ -40,9 +42,9 @@ jobs:
             runcheck: 'no'
             make_target: PROGRAMS=dropbear
 
-          - name: bundled libtom, bionic , no writev()
+          - name: bundled libtom, 22.04, no writev()
             # test can use an older distro with bundled libtommath
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             configure_flags: --enable-bundled-libtom --enable-werror
             # NOWRITEV is unrelated, test here to save a job
             nowritev: 1
@@ -60,6 +62,10 @@ jobs:
             # enable all options
             nondefault: 1
             configure_flags: --enable-pam
+            # sntrup761.c is not c89 compliant
+            localoptions: |
+              #define DROPBEAR_SNTRUP761 0
+              #define DROPBEAR_MLKEM768 0
 
           - name: macos 14
             os: macos-14
@@ -72,9 +78,12 @@ jobs:
             # fails with:
             # .../ranlib: file: libtomcrypt.a(cbc_setiv.o) has no symbols
             ranlib: ranlib -no_warning_for_no_symbols
+            # macos doesn't have setresgid
+            localoptions: |
+              #define DROPBEAR_SVR_DROP_PRIVS 0
 
-          - name: macos 12
-            os: macos-12
+          - name: macos 15
+            os: macos-15
             cc: clang
             # OS X says daemon() and utmp are deprecated.
             # OS X tests for undefined TARGET_OS_EMBEDDED in libc headers
@@ -84,6 +93,9 @@ jobs:
             # fails with:
             # .../ranlib: file: libtomcrypt.a(cbc_setiv.o) has no symbols
             ranlib: ranlib -no_warning_for_no_symbols
+            # macos doesn't have setresgid
+            localoptions: |
+              #define DROPBEAR_SVR_DROP_PRIVS 0
 
           # Check that debug code doesn't bitrot
           - name: DEBUG_TRACE
@@ -133,7 +145,7 @@ jobs:
               #define DROPBEAR_USE_PASSWORD_ENV 0
               #define DROPBEAR_SFTPSERVER 0
 
-          - name: other algo combos
+          - name: no sha1
             runcheck: 'no'
             # disables all sha1
             localoptions: |
@@ -148,6 +160,10 @@ jobs:
               #define DROPBEAR_DH_GROUP16 1
               #define DROPBEAR_SHA2_512_HMAC 1
               #define DROPBEAR_CLI_PUBKEY_AUTH 0
+
+          - name: pq, no plain x25519
+            localoptions: |
+              #define DROPBEAR_CURVE25519 0
 
           # # Fuzzers run standalone. A bit superfluous with cifuzz, but
           # # good to run the whole corpus to keep it working.
@@ -196,7 +212,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: configure
-        run: ./configure $CONFIGURE_FLAGS CFLAGS="-O2 -Wall -Wno-pointer-sign $EXTRACFLAGS" --prefix="$HOME/inst" || (cat config.log; exit 1)
+        run: |
+          $CC --version || echo unknown $CC version
+          ./configure $CONFIGURE_FLAGS CFLAGS="-O2 -Wall -Wno-pointer-sign $EXTRACFLAGS" --prefix="$HOME/inst" || (cat config.log; exit 1)
 
       - name: nowritev
         if: ${{ matrix.nowritev }}
@@ -210,11 +228,13 @@ jobs:
         if: ${{ matrix.nondefault }}
         run: |
           # Turn on anything that's off by default. Rough but seems sufficient
-          grep ' 0$' src/default_options.h | sed 's/0$/1/' > localoptions.h
+          grep ' 0$' src/default_options.h | sed 's/0$/1/' >> localoptions.h
           # PAM clashes with password
           echo "#define DROPBEAR_SVR_PASSWORD_AUTH 0" >> localoptions.h
           # 1 second timeout is too short
           sed -i "s/DEFAULT_IDLE_TIMEOUT 1/DEFAULT_IDLE_TIMEOUT 99/" localoptions.h
+          # DROPBEAR_SVR_DROP_PRIVS is on by default, turn it off
+          echo "#define DROPBEAR_SVR_DROP_PRIVS 0" >> localoptions.h
 
       - name: make
         run: |
@@ -248,6 +268,8 @@ jobs:
           # remove old files so we can rerun in-place with "act -r" during test development
           rm -vf ~/.ssh/id_dropbear*
           ~/inst/bin/dropbearkey -t ecdsa -f ~/.ssh/id_dropbear | grep ^ecdsa > ~/.ssh/authorized_keys
+          # Convert to openssh format so that asyncssh can find it in tests
+          ~/inst/bin/dropbearconvert dropbear openssh ~/.ssh/id_dropbear ~/.ssh/id_ecdsa
 
           # to test setting SSH_PUBKEYINFO, replace the trailing comment
           ~/inst/bin/dropbearkey -t ecdsa -f ~/.ssh/id_dropbear_key2 | grep ^ecdsa | sed 's/[^ ]*$/key2 extra/' >> ~/.ssh/authorized_keys
@@ -256,13 +278,23 @@ jobs:
           chmod 700 ~ ~/.ssh ~/.ssh/authorized_keys
           ls -ld ~ ~/.ssh ~/.ssh/authorized_keys
 
+      - name: binary size
+        run: size dropbear dbclient | tee -a sizes.txt
+
         # upload config.log if something has failed
       - name: config.log
         if: ${{ !env.ACT && (failure() || cancelled()) }}
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: config.log
           path: config.log
+
+      - name: upload sizes
+        if: ${{ matrix.upload_sizes }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sizes.txt
+          path: sizes.txt
 
       - name: check
         if: ${{ matrix.runcheck != 'no' }}
