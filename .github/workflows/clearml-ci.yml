@@ -1,0 +1,59 @@
+# Builds the ClearML dropbear binaries and runs the ClearML tests on both
+# architectures. This is the green/red gate on every sync PR. See .github/CLEARML_SYNC.md.
+name: clearml-ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patch-check:
+    name: clearml patch intact
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream's release tags (namespaced as upstream/*)
+        run: |
+          git remote add upstream https://github.com/mkj/dropbear.git
+          git fetch upstream --no-tags 'refs/tags/*:refs/tags/upstream/*'
+
+      - name: Diff this tree against the upstream release it is based on
+        run: .github/scripts/check_patch.sh
+
+  build-and-test:
+    name: build + test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.sh and build_openssh_sftp_server.sh export with `--output type=tar`, which
+      # needs a builder that supports arbitrary exporters. This creates a docker-container
+      # builder and makes it the default for plain `docker build`, so the build scripts
+      # work unchanged and don't depend on the runner image's BuildKit version.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      - name: Build dropbearmulti + sftp-server, then test the ClearML features
+        run: platform=linux/${{ matrix.arch }} .github/scripts/build_and_test.sh
+
+      # clearml-release.yml downloads these instead of rebuilding.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dropbear-${{ matrix.arch }}
+          path: build/linux/${{ matrix.arch }}/*
+          if-no-files-found: error

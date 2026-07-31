@@ -1,0 +1,115 @@
+# Publishes a release when a sync PR is merged.
+#
+# Triggered only by merging a sync_<version> branch (the branches clearml-sync.yml
+# creates), so releases are always "master, right after a reviewed upstream sync".
+# Rebuilds and re-tests both architectures in a clean runner, then tags and publishes
+# - nothing is ever built on a laptop. See .github/CLEARML_SYNC.md.
+#
+# To release by hand (e.g. a ClearML-only change), name the branch sync_<version>
+# and merge it, or tag and upload the assets from .github/scripts/build_and_test.sh output.
+name: clearml-release
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write # creates the tag and the release
+
+jobs:
+  build:
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'sync_')
+    name: build + test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master # the merge commit
+
+      # See clearml-ci.yml: the build scripts export with `--output type=tar`.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      - name: Build dropbearmulti + sftp-server, then test the ClearML features
+        run: platform=linux/${{ matrix.arch }} .github/scripts/build_and_test.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dropbear-${{ matrix.arch }}
+          path: build/linux/${{ matrix.arch }}/*
+          if-no-files-found: error
+
+  publish:
+    needs: build # only if both architectures built AND passed the tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dropbear-*
+          path: artifacts
+
+      - name: Work out the release version from the branch name
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          version="${HEAD_REF#sync_}" # sync_2026.94 -> 2026.94
+          tag="DROPBEAR_$version"
+          if git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists - nothing to release" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+          echo "TAG=$tag" >>"$GITHUB_ENV"
+
+      - name: Assemble the release assets
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp artifacts/dropbear-amd64/dropbearmulti dist/dropbearmulti_amd64
+          cp artifacts/dropbear-arm64/dropbearmulti dist/dropbearmulti_arm64
+          cp artifacts/dropbear-amd64/sftp-server   dist/sftp-server_amd64
+          cp artifacts/dropbear-arm64/sftp-server   dist/sftp-server_arm64
+          # Unsuffixed copies are amd64, as in every previous release - some consumers
+          # (older agent-bootstrap builds) still download these names.
+          cp dist/dropbearmulti_amd64 dist/dropbearmulti
+          cp dist/sftp-server_amd64   dist/sftp-server
+          ls -l dist
+
+      - name: Tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # The same description every previous release carries.
+          NOTES: |
+            Static Dropbear build, for use inside non-root docker containers to gain remote SSH access.
+            Set environment DROPBEAR_CLEARML_FIXED_PASSWORD=password to allow fixed user (i.e. dropbear process user) with fixed password login via SSH.
+
+            Set environment SFTPSERVER_PATH=/dropbear/sftp-server to enable sftp support
+
+            Supported platforms: linux/amd64 (x86-64), linux/arm64/v8 (aarch64)
+        run: |
+          set -euo pipefail
+          git config user.name clearml
+          git config user.email none@none
+          git tag -a "$TAG" -m "Dropbear $VERSION w/ single user fixed password"
+          git push origin "$TAG"
+
+          gh release create "$TAG" dist/* \
+            --title "Dropbear $VERSION w/ single user fixed password" \
+            --notes "$NOTES"
+
+          echo "**Published $TAG** <${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG>" >>"$GITHUB_STEP_SUMMARY"

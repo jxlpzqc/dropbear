@@ -1,0 +1,209 @@
+# Nightly check for a new upstream Dropbear release.
+#
+# This fork shares no git history with upstream, so a sync applies *upstream's delta
+# between two releases* on top of our tree with a 3-way merge, instead of merging
+# branches. ClearML's own changes survive automatically; only a genuine overlap
+# conflicts. Background and the manual procedure: .github/CLEARML_SYNC.md.
+#
+#   applies cleanly -> pushes sync_<version> and opens a PR (clearml-ci runs on it,
+#                      and merging that PR publishes the release)
+#   conflicts       -> opens an issue naming the conflicting files, changes nothing
+name: clearml-sync
+
+on:
+  schedule:
+    - cron: '0 5 * * *' # every night at 05:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read # the branch and PR are created with SYNC_TOKEN, so that clearml-ci runs on them
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    # SYNC_TOKEN lives in this environment, so only this job can read it. A sync applies
+    # upstream's delta including any changes to .github/workflows/*, and those workflows
+    # then run here - naming the environment keeps the token out of their reach.
+    environment: sync-upstream
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Fetch upstream's release tags (namespaced as upstream/*)
+        run: |
+          git remote add upstream https://github.com/mkj/dropbear.git
+          git fetch upstream --no-tags 'refs/tags/*:refs/tags/upstream/*'
+
+      - name: Which release are we on, and what is the newest upstream one?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Our own releases are named after the upstream release they were synced
+          # from, so our latest release name IS the base of the next sync.
+          base=$(gh release view --json tagName --jq .tagName)
+          latest=$(gh release view -R mkj/dropbear --json tagName --jq .tagName)
+          branch="sync_${latest#DROPBEAR_}"
+
+          {
+            echo "| | |"
+            echo "|---|---|"
+            echo "| our latest release | \`$base\` |"
+            echo "| newest upstream release | \`$latest\` |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          needed=true
+          if [ "$base" = "$latest" ]; then
+            needed=false
+            echo -e "\n**Up to date - nothing to do.**" >>"$GITHUB_STEP_SUMMARY"
+          elif git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            needed=false
+            echo -e "\n**\`$branch\` already exists - nothing to do.**" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "needed=$needed" >>"$GITHUB_OUTPUT"
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+          echo "latest=$latest" >>"$GITHUB_OUTPUT"
+          echo "branch=$branch" >>"$GITHUB_OUTPUT"
+          echo "version=${latest#DROPBEAR_}" >>"$GITHUB_OUTPUT"
+
+      - name: Confirm our tree really is "upstream ${{ steps.check.outputs.base }} + ClearML's files"
+        if: steps.check.outputs.needed == 'true'
+        run: .github/scripts/check_patch.sh "${{ steps.check.outputs.base }}"
+
+      - name: Apply upstream's delta with a 3-way merge
+        id: apply
+        if: steps.check.outputs.needed == 'true'
+        env:
+          BASE: ${{ steps.check.outputs.base }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name clearml
+          git config user.email none@none
+          git checkout -b "$BRANCH"
+
+          git diff "upstream/$BASE" "upstream/$LATEST" |
+            git apply --3way --whitespace=nowarn || true
+
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [ -n "$conflicts" ]; then
+            echo "clean=false" >>"$GITHUB_OUTPUT"
+            {
+              echo "conflicts<<EOF"
+              echo "$conflicts"
+              echo "EOF"
+            } >>"$GITHUB_OUTPUT"
+          else
+            echo "clean=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify our changes survived the merge
+        if: steps.apply.outputs.clean == 'true'
+        run: .github/scripts/check_patch.sh "${{ steps.check.outputs.latest }}"
+
+      - name: Push the branch and open the PR
+        if: steps.apply.outputs.clean == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # Override with a repo variable: gh variable set SYNC_ASSIGNEES -b 'user1,user2'
+          ASSIGNEES: ${{ vars.SYNC_ASSIGNEES || 'filippo-clearml' }}
+          BASE: ${{ steps.check.outputs.base }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          commits=$(git rev-list --count "upstream/$BASE..upstream/$LATEST")
+          shortstat=$(git diff --shortstat "upstream/$BASE" "upstream/$LATEST" | sed 's/^ *//')
+          ours=$(git diff --stat "upstream/$BASE" "upstream/$LATEST" \
+                   -- src/svr-auth.c src/svr-chansession.c)
+
+          cat >/tmp/pr-body.md <<EOF
+          Applied upstream's delta \`$BASE..$LATEST\` on top of \`master\` with a 3-way
+          merge (no conflicts), opened automatically by \`clearml-sync.yml\`.
+
+          | | |
+          |---|---|
+          | upstream delta | $commits commits, $shortstat |
+          | upstream release | https://github.com/mkj/dropbear/releases/tag/$LATEST |
+
+          **Upstream changes to the patched files** (empty means they were not touched):
+          \`\`\`
+          ${ours:-none}
+          \`\`\`
+
+          Everything upstream changed is in this diff - review \`CHANGES\` and \`debian/changelog\` for the release notes.
+
+          Before merging:
+          - [ ] \`clearml-ci\` is green on both architectures
+          - [ ] Review diffs to \`src/svr-auth.c\` / \`src/svr-chansession.c\` for unexpected changes
+          - [ ] Review \`CHANGES\` for behaviour or configuration changes that affect the build or the runtime
+
+          **Merging this PR tags and publishes the release for \`DROPBEAR_$VERSION\`**.
+          EOF
+
+          git add -A
+          git commit -m "Update $VERSION (sync upstream $BASE..$LATEST)"
+          git push origin "$BRANCH"
+
+          url=$(gh pr create \
+            --base master --head "$BRANCH" \
+            --title "Update $VERSION (sync upstream $BASE..$LATEST)" \
+            --assignee "$ASSIGNEES" \
+            --body-file /tmp/pr-body.md)
+
+          echo -e "\n**Opened $url** - $commits commits, $shortstat" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Report conflicts as an issue and fail
+        if: steps.apply.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ASSIGNEES: ${{ vars.SYNC_ASSIGNEES || 'filippo-clearml' }}
+          BASE: ${{ steps.check.outputs.base }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+          CONFLICTS: ${{ steps.apply.outputs.conflicts }}
+        run: |
+          set -euo pipefail
+          cat >/tmp/issue-body.md <<EOF
+          Applying upstream's delta \`$BASE..$LATEST\` conflicts with ClearML's changes,
+          so \`clearml-sync.yml\` did not open a PR. Nothing was pushed.
+
+          Conflicting files:
+          \`\`\`
+          $CONFLICTS
+          \`\`\`
+
+          To resolve locally (see .github/CLEARML_SYNC.md):
+          \`\`\`bash
+          git fetch upstream --no-tags 'refs/tags/*:refs/tags/upstream/*'
+          git checkout -b $BRANCH master
+          git diff upstream/$BASE upstream/$LATEST | git apply --3way --whitespace=nowarn
+          # resolve the conflict markers, then:
+          .github/scripts/check_patch.sh $LATEST
+          .github/scripts/build_and_test.sh
+          git commit -am "Update ${LATEST#DROPBEAR_} (sync upstream $BASE..$LATEST)"
+          git push origin $BRANCH   # then open a PR from this branch to release it
+          \`\`\`
+          EOF
+
+          if gh issue list --search "$LATEST conflicts in:title" --state open --json number --jq '.[0].number' | grep -q .; then
+            echo "issue already open for $LATEST"
+          else
+            gh issue create \
+              --title "Upstream $LATEST conflicts with ClearML's changes" \
+              --assignee "$ASSIGNEES" \
+              --body-file /tmp/issue-body.md
+          fi
+
+          echo -e "\n**Conflicts in:** \`$(echo "$CONFLICTS" | tr '\n' ' ')\`" >>"$GITHUB_STEP_SUMMARY"
+          exit 1
