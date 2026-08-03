@@ -8,6 +8,8 @@
 #   applies cleanly -> pushes sync_<version> and opens a PR (clearml-ci runs on it,
 #                      and merging that PR publishes the release)
 #   conflicts       -> opens an issue naming the conflicting files, changes nothing
+#
+# Only the `sync` job is gated, so a check with no new release is not gated for approval.
 name: clearml-sync
 
 on:
@@ -20,23 +22,15 @@ permissions:
   issues: write
 
 jobs:
-  sync:
+  check:
     runs-on: ubuntu-24.04
-    # SYNC_TOKEN lives in this environment, so only this job can read it. A sync applies
-    # upstream's delta including any changes to .github/workflows/*, and those workflows
-    # then run here - naming the environment keeps the token out of their reach.
-    environment: sync-upstream
+    outputs:
+      needed: ${{ steps.check.outputs.needed }}
+      base: ${{ steps.check.outputs.base }}
+      latest: ${{ steps.check.outputs.latest }}
+      branch: ${{ steps.check.outputs.branch }}
+      version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.SYNC_TOKEN }}
-
-      - name: Fetch upstream's release tags (namespaced as upstream/*)
-        run: |
-          git remote add upstream https://github.com/mkj/dropbear.git
-          git fetch upstream --no-tags 'refs/tags/*:refs/tags/upstream/*'
-
       - name: Which release are we on, and what is the newest upstream one?
         id: check
         env:
@@ -61,7 +55,7 @@ jobs:
           if [ "$base" = "$latest" ]; then
             needed=false
             echo -e "\n**Up to date - nothing to do.**" >>"$GITHUB_STEP_SUMMARY"
-          elif git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+          elif gh api "repos/$GH_REPO/git/ref/heads/$branch" >/dev/null 2>&1; then
             needed=false
             echo -e "\n**\`$branch\` already exists - nothing to do.**" >>"$GITHUB_STEP_SUMMARY"
           fi
@@ -72,17 +66,32 @@ jobs:
           echo "branch=$branch" >>"$GITHUB_OUTPUT"
           echo "version=${latest#DROPBEAR_}" >>"$GITHUB_OUTPUT"
 
-      - name: Confirm our tree really is "upstream ${{ steps.check.outputs.base }} + ClearML's files"
-        if: steps.check.outputs.needed == 'true'
-        run: .github/scripts/check_patch.sh "${{ steps.check.outputs.base }}"
+  sync:
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    runs-on: ubuntu-24.04
+    environment: sync-upstream # holds SYNC_TOKEN, closed access
+    env:
+      BASE: ${{ needs.check.outputs.base }}
+      LATEST: ${{ needs.check.outputs.latest }}
+      BRANCH: ${{ needs.check.outputs.branch }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Fetch upstream's release tags (namespaced as upstream/*)
+        run: |
+          git remote add upstream https://github.com/mkj/dropbear.git
+          git fetch upstream --no-tags 'refs/tags/*:refs/tags/upstream/*'
+
+      - name: Confirm our tree really is "upstream ${{ needs.check.outputs.base }} + ClearML's files"
+        run: .github/scripts/check_patch.sh "$BASE"
 
       - name: Apply upstream's delta with a 3-way merge
         id: apply
-        if: steps.check.outputs.needed == 'true'
-        env:
-          BASE: ${{ steps.check.outputs.base }}
-          LATEST: ${{ steps.check.outputs.latest }}
-          BRANCH: ${{ steps.check.outputs.branch }}
         run: |
           set -euo pipefail
           git config user.name clearml
@@ -106,7 +115,7 @@ jobs:
 
       - name: Verify our changes survived the merge
         if: steps.apply.outputs.clean == 'true'
-        run: .github/scripts/check_patch.sh "${{ steps.check.outputs.latest }}"
+        run: .github/scripts/check_patch.sh "$LATEST"
 
       - name: Push the branch and open the PR
         if: steps.apply.outputs.clean == 'true'
@@ -115,10 +124,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
           # Override with a repo variable: gh variable set SYNC_ASSIGNEES -b 'user1,user2'
           ASSIGNEES: ${{ vars.SYNC_ASSIGNEES || 'filippo-clearml' }}
-          BASE: ${{ steps.check.outputs.base }}
-          LATEST: ${{ steps.check.outputs.latest }}
-          BRANCH: ${{ steps.check.outputs.branch }}
-          VERSION: ${{ steps.check.outputs.version }}
         run: |
           set -euo pipefail
           commits=$(git rev-list --count "upstream/$BASE..upstream/$LATEST")
@@ -154,11 +159,17 @@ jobs:
           git commit -m "Update $VERSION (sync upstream $BASE..$LATEST)"
           git push origin "$BRANCH"
 
-          url=$(gh pr create \
-            --base master --head "$BRANCH" \
-            --title "Update $VERSION (sync upstream $BASE..$LATEST)" \
-            --assignee "$ASSIGNEES" \
-            --body-file /tmp/pr-body.md)
+          # a PR's author cannot be asked to review it; `|| true` for when they are the only name
+          author=$(gh api user --jq .login)
+          reviewers=$(printf '%s' "$ASSIGNEES" | tr ',' '\n' | grep -vxF "$author" | paste -sd, - || true)
+
+          args=(--base master --head "$BRANCH"
+                --title "Update $VERSION (sync upstream $BASE..$LATEST)"
+                --assignee "$ASSIGNEES"
+                --body-file /tmp/pr-body.md)
+          if [ -n "$reviewers" ]; then args+=(--reviewer "$reviewers"); fi
+
+          url=$(gh pr create "${args[@]}")
 
           echo -e "\n**Opened $url** - $commits commits, $shortstat" >>"$GITHUB_STEP_SUMMARY"
 
@@ -168,9 +179,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           ASSIGNEES: ${{ vars.SYNC_ASSIGNEES || 'filippo-clearml' }}
-          BASE: ${{ steps.check.outputs.base }}
-          LATEST: ${{ steps.check.outputs.latest }}
-          BRANCH: ${{ steps.check.outputs.branch }}
           CONFLICTS: ${{ steps.apply.outputs.conflicts }}
         run: |
           set -euo pipefail
