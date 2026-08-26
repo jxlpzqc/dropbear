@@ -41,6 +41,7 @@
 #include "runopts.h"
 #include "crypto_desc.h"
 #include "fuzz.h"
+#include "usermap.h"
 
 static void svr_remoteclosed(void);
 static void svr_algos_initialise(void);
@@ -305,6 +306,9 @@ void svr_dropbear_exit(int exitcode, const char* format, va_list param) {
 		sign_key_free(svr_opts.hostkey);
 		svr_opts.hostkey = NULL;
 	}
+
+	usermap_cleanup();
+
 	for (i = 0; i < DROPBEAR_MAX_PORTS; i++) {
 		m_free(svr_opts.addresses[i]);
 		m_free(svr_opts.ports[i]);

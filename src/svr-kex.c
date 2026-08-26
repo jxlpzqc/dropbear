@@ -156,17 +156,26 @@ static void svr_ensure_hostkey(void) {
 
 	expand_fn = expand_homedir_path(fn);
 
-	ret = readhostkey(expand_fn, svr_opts.hostkey, &type);
-	if (ret == DROPBEAR_SUCCESS) {
-		goto out;
-	}
+	/* --memory-host-key: generate the key in memory instead of reading or
+	 * writing host key files. */
+	if (svr_opts.memory_hostkey) {
+		if (signkey_generate_in_mem(type, svr_opts.hostkey) == DROPBEAR_SIGNKEY_NONE) {
+			goto out;
+		}
+		ret = DROPBEAR_SUCCESS;
+	} else {
+		ret = readhostkey(expand_fn, svr_opts.hostkey, &type);
+		if (ret == DROPBEAR_SUCCESS) {
+			goto out;
+		}
 
-	if (signkey_generate(type, 0, expand_fn, 1) == DROPBEAR_FAILURE) {
-		goto out;
+		if (signkey_generate(type, 0, expand_fn, 1) == DROPBEAR_FAILURE) {
+			goto out;
+		}
+
+		/* Read what we just generated (or another process raced us) */
+		ret = readhostkey(expand_fn, svr_opts.hostkey, &type);
 	}
-	
-	/* Read what we just generated (or another process raced us) */
-	ret = readhostkey(expand_fn, svr_opts.hostkey, &type);
 
 	if (ret == DROPBEAR_SUCCESS) {
 		char *fp = NULL;
@@ -204,7 +213,7 @@ static void send_msg_kexdh_reply(mp_int *dh_e, buffer *q_c) {
 	CHECKCLEARTOWRITE();
 
 #if DROPBEAR_DELAY_HOSTKEY
-	if (svr_opts.delay_hostkey)
+	if (svr_opts.delay_hostkey || svr_opts.memory_hostkey_lazy)
 	{
 		svr_ensure_hostkey();
 	}

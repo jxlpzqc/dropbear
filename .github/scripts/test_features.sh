@@ -80,14 +80,18 @@ wait_for_ssh_banner() {
 }
 
 # $@ is passed to docker run, so the caller decides which env vars dropbear sees.
+# Extra dropbear command-line args come from DROPBEAR_ARGS (default: -r /tmp/hostkey);
+# set DROPBEAR_AS_ROOT=1 to run the server as root (needed by the usermap case).
 start_server() {
+	local user_args="--user 1000"
+	[ -n "${DROPBEAR_AS_ROOT:-}" ] && user_args=""
 	docker rm -f "$container" >/dev/null 2>&1
-	docker run -d --name "$container" --platform "$platform" --user 1000 \
+	docker run -d --name "$container" --platform "$platform" $user_args \
 		-p "$port:$port" -v "$bin_dir:/dropbear:ro" \
 		-e SFTPSERVER_PATH=/dropbear/sftp-server "$@" \
 		"$image" sh -c "
 			/dropbear/dropbearmulti dropbearkey -t ed25519 -f /tmp/hostkey >/dev/null &&
-			exec /dropbear/dropbearmulti dropbear -e -F -p $port -r /tmp/hostkey" >/dev/null || return 1
+			exec /dropbear/dropbearmulti dropbear -e -F -p $port ${DROPBEAR_ARGS:--r /tmp/hostkey}" >/dev/null || return 1
 	wait_for_ssh_banner
 }
 
@@ -139,6 +143,42 @@ if TEST_PASSWORD="$password" ssh "${ssh_opts[@]}" anyuser@localhost true 2>/dev/
 	fail "login succeeded with DROPBEAR_CLEARML_FIXED_PASSWORD unset - auth bypass!"
 else
 	pass "no password bypass when DROPBEAR_CLEARML_FIXED_PASSWORD is unset"
+fi
+
+# --- cases 5-6: usermap -------------------------------------------------------
+# --user-map maps a login name to a system uid with a fixed password. The target
+# must exist in /etc/passwd, so this server runs as root and maps to uid 0.
+# DROPBEAR_ARGS replaces the default "-r /tmp/hostkey", so it is given again.
+DROPBEAR_AS_ROOT=1 DROPBEAR_ARGS="-r /tmp/hostkey --user-map usermapuser:0:${password}" start_server || exit 2
+
+if out=$(TEST_PASSWORD="$password" ssh "${ssh_opts[@]}" usermapuser@localhost 'echo MAP_$(id -u)' 2>"$tmp_dir/err") &&
+	[ "$out" = "MAP_0" ]; then
+	pass "usermap login maps to the target uid"
+else
+	fail "usermap login (got '${out:-}', stderr: $(tr '\n' ' ' <"$tmp_dir/err"))"
+fi
+
+if TEST_PASSWORD="wrong-$password" ssh "${ssh_opts[@]}" usermapuser@localhost true 2>/dev/null; then
+	fail "usermap wrong password was ACCEPTED"
+else
+	pass "usermap wrong password rejected"
+fi
+
+# A user not in the usermap must not be able to log in with the usermap password.
+if TEST_PASSWORD="$password" ssh "${ssh_opts[@]}" nomapuser@localhost true 2>/dev/null; then
+	fail "non-usermap user logged in with the usermap password"
+else
+	pass "non-usermap user rejected"
+fi
+
+# --- case 7: --memory-host-key ------------------------------------------------
+# Host keys are generated in memory; no key file is needed on disk.
+DROPBEAR_ARGS="--memory-host-key" start_server -e "DROPBEAR_CLEARML_FIXED_PASSWORD=$password" || exit 2
+if out=$(TEST_PASSWORD="$password" ssh "${ssh_opts[@]}" anyuser@localhost 'echo MEMORY_$(id -u)' 2>"$tmp_dir/err") &&
+	[ "$out" = "MEMORY_1000" ]; then
+	pass "in-memory host key login"
+else
+	fail "in-memory host key login (got '${out:-}', stderr: $(tr '\n' ' ' <"$tmp_dir/err"))"
 fi
 
 echo

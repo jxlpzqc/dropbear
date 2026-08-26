@@ -129,6 +129,15 @@ typedef struct svr_runopts {
 	char * forced_command;
 	char* interface;
 
+	/* Generate host keys in memory, never writing them to disk. */
+	int memory_hostkey;
+	/* If set, the in-memory host keys are generated lazily on the first
+	 * connection rather than at startup. */
+	int memory_hostkey_lazy;
+	/* Set once the in-memory host keys have been generated (used to ensure
+	 * the keys are only generated once, in the parent process). */
+	int memory_hostkey_generated;
+
 #if DROPBEAR_PLUGIN
 	/* malloced */
 	char *pubkey_plugin;
@@ -144,6 +153,7 @@ extern svr_runopts svr_opts;
 
 void svr_getopts(int argc, char ** argv);
 void loadhostkeys(void);
+void svr_ensure_memory_hostkeys(void);
 
 typedef struct cli_runopts {
 	/* All non-const strings are malloced */

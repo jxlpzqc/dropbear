@@ -31,11 +31,23 @@ clearml_files=(
 	.github/workflows/clearml-sync.yml
 	.gitignore
 	Dockerfile
+	Makefile.in
 	build.sh
 	build_openssh_sftp_server.sh
 	openssh_sftp_server_build_static.Dockerfile
+	src/auth.h
+	src/gensignkey.c
+	src/gensignkey.h
+	src/runopts.h
 	src/svr-auth.c
+	src/svr-authpasswd.c
 	src/svr-chansession.c
+	src/svr-kex.c
+	src/svr-main.c
+	src/svr-runopts.c
+	src/svr-session.c
+	src/usermap.c
+	src/usermap.h
 	test_fixed_password_login.sh
 )
 
