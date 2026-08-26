@@ -148,7 +148,8 @@ fi
 # --- cases 5-6: usermap -------------------------------------------------------
 # --user-map maps a login name to a system uid with a fixed password. The target
 # must exist in /etc/passwd, so this server runs as root and maps to uid 0.
-DROPBEAR_AS_ROOT=1 DROPBEAR_ARGS="--user-map usermapuser:0:${password}" start_server || exit 2
+# DROPBEAR_ARGS replaces the default "-r /tmp/hostkey", so it is given again.
+DROPBEAR_AS_ROOT=1 DROPBEAR_ARGS="-r /tmp/hostkey --user-map usermapuser:0:${password}" start_server || exit 2
 
 if out=$(TEST_PASSWORD="$password" ssh "${ssh_opts[@]}" usermapuser@localhost 'echo MAP_$(id -u)' 2>"$tmp_dir/err") &&
 	[ "$out" = "MAP_0" ]; then
