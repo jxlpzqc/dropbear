@@ -29,6 +29,8 @@
 #include "dbutil.h"
 #include "algo.h"
 #include "ecdsa.h"
+#include "gensignkey.h"
+#include "usermap.h"
 
 #include <grp.h>
 
@@ -39,6 +41,7 @@ static void addportandaddress(const char* spec);
 static void loadhostkey(const char *keyfile, int fatal_duplicate);
 static void addhostkey(const char *keyfile);
 static void load_banner(void);
+static int svr_parse_longopts(const char *arg, char **argv, int argi, int argc);
 
 static void printhelp(const char * progname) {
 
@@ -64,6 +67,16 @@ static void printhelp(const char * progname) {
 #if DROPBEAR_SVR_PUBKEY_AUTH
 					"-D		Directory containing authorized_keys file\n"
 #endif
+					"--user-map <user:@uid_or_username:password>\n"
+					"		Map a login user to a system uid/username with a\n"
+					"		fixed password (repeatable). A numeric target is a\n"
+					"		uid, a '@name' target is resolved via getpwnam()\n"
+					"--user-map-file <file>\n"
+					"		Read user mappings from <file>, one per line\n"
+					"--memory-host-key[=startup|first]\n"
+					"		Generate host keys in memory. 'startup' (default)\n"
+					"		generates them at startup, 'first' on the first\n"
+					"		connection. Keys are never written to disk\n"
 #if DROPBEAR_DELAY_HOSTKEY
 					"-R		Create hostkeys as required\n" 
 #endif
@@ -184,6 +197,9 @@ void svr_getopts(int argc, char ** argv) {
 	svr_opts.delay_hostkey = 0;
 	svr_opts.pidfile = expand_homedir_path(DROPBEAR_PIDFILE);
 	svr_opts.authorized_keys_dir = "~/.ssh";
+	svr_opts.memory_hostkey = 0;
+	svr_opts.memory_hostkey_lazy = 0;
+	svr_opts.memory_hostkey_generated = 0;
 #if DROPBEAR_SVR_LOCALANYFWD
 	svr_opts.nolocaltcp = 0;
 #endif
@@ -224,6 +240,14 @@ void svr_getopts(int argc, char ** argv) {
 	for (i = 1; i < (unsigned int)argc; i++) {
 		if (argv[i][0] != '-' || argv[i][1] == '\0')
 			dropbear_exit("Invalid argument: %s", argv[i]);
+
+		/* Long options: --user-map, --user-map-file, --memory-host-key.
+		 * Only the space-separated argument form is needed here; '=' forms
+		 * are handled in svr_parse_longopts(). */
+		if (argv[i][0] == '-' && argv[i][1] == '-') {
+			i = svr_parse_longopts(argv[i], argv, i, argc);
+			continue;
+		}
 
 		for (j = 1; (c = argv[i][j]) != '\0' && !next && !nextisport; j++) {
 			switch (c) {
@@ -522,6 +546,60 @@ void svr_getopts(int argc, char ** argv) {
 	}
 }
 
+/* Handle one long option (argv[argi], which begins with "--"). Handles both
+ * "--opt=value" and "--opt value" argument forms. Returns the updated argi
+ * (argv index) after any argument has been consumed. */
+static int svr_parse_longopts(const char *arg, char **argv, int argi, int argc) {
+	const char *opt = arg + 2;
+	char *optbuf = NULL;
+	const char *value = NULL;
+	const char *eq = strchr(opt, '=');
+
+	if (eq) {
+		optbuf = m_strdup(opt);
+		optbuf[eq - opt] = '\0';
+		value = eq + 1;
+	} else {
+		optbuf = m_strdup(opt);
+	}
+
+	if (strcmp(optbuf, "user-map") == 0) {
+		if (value == NULL) {
+			if (argi + 1 >= argc) {
+				dropbear_exit("Missing argument for --user-map");
+			}
+			value = argv[++argi];
+		}
+		usermap_add(value);
+	} else if (strcmp(optbuf, "user-map-file") == 0) {
+		if (value == NULL) {
+			if (argi + 1 >= argc) {
+				dropbear_exit("Missing argument for --user-map-file");
+			}
+			value = argv[++argi];
+		}
+		usermap_read_file(value);
+	} else if (strcmp(optbuf, "memory-host-key") == 0) {
+		if (value == NULL) {
+			/* default: generate at startup */
+			svr_opts.memory_hostkey = 1;
+		} else if (strcmp(value, "startup") == 0) {
+			svr_opts.memory_hostkey = 1;
+		} else if (strcmp(value, "first") == 0) {
+			svr_opts.memory_hostkey = 1;
+			svr_opts.memory_hostkey_lazy = 1;
+		} else {
+			dropbear_exit("Bad --memory-host-key value '%s' (use 'startup' or 'first')",
+				value);
+		}
+	} else {
+		dropbear_exit("Invalid option --%s", optbuf);
+	}
+
+	m_free(optbuf);
+	return argi;
+}
+
 static void addportandaddress(const char* spec) {
 	char *port = NULL, *address = NULL;
 
@@ -593,7 +671,9 @@ static void loadhostkey(const char *keyfile, int fatal_duplicate) {
 	char *expand_path = expand_homedir_path(keyfile);
 	enum signkey_type type = DROPBEAR_SIGNKEY_ANY;
 	if (readhostkey(expand_path, read_key, &type) == DROPBEAR_FAILURE) {
-		if (!svr_opts.delay_hostkey) {
+		/* Missing files are expected when host keys are generated lazily
+		 * (-R) or in memory (--memory-host-key). */
+		if (!svr_opts.delay_hostkey && !svr_opts.memory_hostkey) {
 			dropbear_log(LOG_WARNING, "Failed loading %s", expand_path);
 		}
 	}
@@ -651,6 +731,9 @@ static void addhostkey(const char *keyfile) {
 void load_all_hostkeys() {
 	int i;
 	int any_keys = 0;
+	/* True when host keys may be (re)generated after startup, either by the
+	 * existing -R behaviour or by --memory-host-key=first. */
+	int hostkey_delayed;
 #if DROPBEAR_ECDSA
 	int loaded_any_ecdsa = 0;
 #endif
@@ -681,8 +764,47 @@ void load_all_hostkeys() {
 #endif
 	}
 
+	hostkey_delayed = svr_opts.delay_hostkey || svr_opts.memory_hostkey_lazy;
+
+	if (svr_opts.memory_hostkey) {
+		/* Re-exec is disabled so the forked children inherit the same
+		 * in-memory keys (see svr-main.c). */
+		dropbear_log(LOG_INFO, "In-memory host keys %s, re-exec disabled",
+			svr_opts.memory_hostkey_lazy
+				? "will be generated on first connection"
+				: "generated at startup");
+	}
+
+	/* --memory-host-key (startup mode): generate any missing default host
+	 * keys in memory so the server can always advertise a full key set
+	 * without ever persisting keys to disk. */
+	if (svr_opts.memory_hostkey && !svr_opts.memory_hostkey_lazy) {
 #if DROPBEAR_RSA
-	if (!svr_opts.delay_hostkey && !svr_opts.hostkey->rsakey) {
+		if (!svr_opts.hostkey->rsakey) {
+			signkey_generate_in_mem(DROPBEAR_SIGNKEY_RSA, svr_opts.hostkey);
+		}
+#endif
+#if DROPBEAR_DSS
+		if (!svr_opts.hostkey->dsskey) {
+			signkey_generate_in_mem(DROPBEAR_SIGNKEY_DSS, svr_opts.hostkey);
+		}
+#endif
+#if DROPBEAR_ECDSA
+		if (!svr_opts.hostkey->ecckey256
+			&& !svr_opts.hostkey->ecckey384
+			&& !svr_opts.hostkey->ecckey521) {
+			signkey_generate_in_mem(DROPBEAR_SIGNKEY_ECDSA_KEYGEN, svr_opts.hostkey);
+		}
+#endif
+#if DROPBEAR_ED25519
+		if (!svr_opts.hostkey->ed25519key) {
+			signkey_generate_in_mem(DROPBEAR_SIGNKEY_ED25519, svr_opts.hostkey);
+		}
+#endif
+	}
+
+#if DROPBEAR_RSA
+	if (!hostkey_delayed && !svr_opts.hostkey->rsakey) {
 #if DROPBEAR_RSA_SHA256
 		disablekey(DROPBEAR_SIGNATURE_RSA_SHA256);
 #endif
@@ -695,7 +817,7 @@ void load_all_hostkeys() {
 #endif
 
 #if DROPBEAR_DSS
-	if (!svr_opts.delay_hostkey && !svr_opts.hostkey->dsskey) {
+	if (!hostkey_delayed && !svr_opts.hostkey->dsskey) {
 		disablekey(DROPBEAR_SIGNATURE_DSS);
 	} else {
 		any_keys = 1;
@@ -724,31 +846,31 @@ void load_all_hostkeys() {
 	any_keys |= loaded_any_ecdsa;
 
 	/* Or an ecdsa key could be generated at runtime */
-	any_keys |= svr_opts.delay_hostkey;
+	any_keys |= hostkey_delayed;
 
 	/* At most one ecdsa key size will be left enabled */
 #if DROPBEAR_ECC_256
 	if (!svr_opts.hostkey->ecckey256
-		&& (!svr_opts.delay_hostkey || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 256 )) {
+		&& (!hostkey_delayed || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 256 )) {
 		disablekey(DROPBEAR_SIGNATURE_ECDSA_NISTP256);
 	}
 #endif
 #if DROPBEAR_ECC_384
 	if (!svr_opts.hostkey->ecckey384
-		&& (!svr_opts.delay_hostkey || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 384 )) {
+		&& (!hostkey_delayed || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 384 )) {
 		disablekey(DROPBEAR_SIGNATURE_ECDSA_NISTP384);
 	}
 #endif
 #if DROPBEAR_ECC_521
 	if (!svr_opts.hostkey->ecckey521
-		&& (!svr_opts.delay_hostkey || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 521 )) {
+		&& (!hostkey_delayed || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 521 )) {
 		disablekey(DROPBEAR_SIGNATURE_ECDSA_NISTP521);
 	}
 #endif
 #endif /* DROPBEAR_ECDSA */
 
 #if DROPBEAR_ED25519
-	if (!svr_opts.delay_hostkey && !svr_opts.hostkey->ed25519key) {
+	if (!hostkey_delayed && !svr_opts.hostkey->ed25519key) {
 		disablekey(DROPBEAR_SIGNATURE_ED25519);
 	} else {
 		any_keys = 1;
@@ -764,6 +886,45 @@ void load_all_hostkeys() {
 	if (!any_keys) {
 		dropbear_exit("No hostkeys available. 'dropbear -R' may be useful or run dropbearkey.");
 	}
+}
+
+/* Generate all default host key types in memory. Used for
+ * --memory-host-key=first so the keys are generated in the parent process on
+ * the first connection and inherited (stable) by all forked children.
+ * Generation only happens once. */
+void svr_ensure_memory_hostkeys(void) {
+	if (svr_opts.memory_hostkey_generated) {
+		return;
+	}
+	svr_opts.memory_hostkey_generated = 1;
+
+	if (!svr_opts.hostkey) {
+		svr_opts.hostkey = new_sign_key();
+	}
+#if DROPBEAR_RSA
+	if (!svr_opts.hostkey->rsakey) {
+		signkey_generate_in_mem(DROPBEAR_SIGNKEY_RSA, svr_opts.hostkey);
+	}
+#endif
+#if DROPBEAR_DSS
+	if (!svr_opts.hostkey->dsskey) {
+		signkey_generate_in_mem(DROPBEAR_SIGNKEY_DSS, svr_opts.hostkey);
+	}
+#endif
+#if DROPBEAR_ECDSA
+	if (!svr_opts.hostkey->ecckey256
+		&& !svr_opts.hostkey->ecckey384
+		&& !svr_opts.hostkey->ecckey521) {
+		signkey_generate_in_mem(DROPBEAR_SIGNKEY_ECDSA_KEYGEN, svr_opts.hostkey);
+	}
+#endif
+#if DROPBEAR_ED25519
+	if (!svr_opts.hostkey->ed25519key) {
+		signkey_generate_in_mem(DROPBEAR_SIGNKEY_ED25519, svr_opts.hostkey);
+	}
+#endif
+
+	dropbear_log(LOG_INFO, "Generated in-memory host keys on first connection");
 }
 
 static void load_banner(void) {

@@ -302,6 +302,15 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 
 			seedrandom();
 
+#if DROPBEAR_DELAY_HOSTKEY
+			/* --memory-host-key=first: generate the in-memory host keys in
+			 * the parent on the first connection so that every forked child
+			 * inherits the same stable keys. */
+			if (svr_opts.memory_hostkey_lazy) {
+				svr_ensure_memory_hostkeys();
+			}
+#endif
+
 			if (pipe(childpipe) < 0) {
 				TRACE(("error creating child pipe"))
 				goto out;
@@ -353,7 +362,10 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 
 				m_close(childpipe[0]);
 
-				if (execfd >= 0) {
+				/* With --memory-host-key the keys live only in this process's
+				 * memory, so the child must stay a plain fork (which inherits
+				 * the generated keys) rather than re-executing itself. */
+				if (execfd >= 0 && !svr_opts.memory_hostkey) {
 #if DROPBEAR_DO_REEXEC
 					/* Add "-2 childpipe[1]" to the args and re-execute ourself. */
 					char **new_argv = m_malloc(sizeof(char*) * (argc+4));

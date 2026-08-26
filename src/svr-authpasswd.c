@@ -49,12 +49,14 @@ static int constant_time_strcmp(const char* a, const char* b) {
 /* Process a password auth request, sending success or failure messages as
  * appropriate */
 void svr_auth_password(int valid_user) {
-	
+
 	char * passwdcrypt = NULL; /* the crypt from /etc/passwd or /etc/shadow */
 	char * testcrypt = NULL; /* crypt generated from the user's password sent */
 	char * password = NULL;
 	unsigned int passwordlen;
 	unsigned int changepw;
+	int usermap_auth = 0; /* username is mapped via usermap */
+	int auth_success = 0;
 
 	/* check if client wants to change password */
 	changepw = buf_getbool(ses.payload);
@@ -65,10 +67,16 @@ void svr_auth_password(int valid_user) {
 	}
 
 	password = buf_getstring(ses.payload, &passwordlen);
+	usermap_auth = ses.authstate.is_usermap_user;
 	if (valid_user && passwordlen <= DROPBEAR_MAX_PASSWORD_LEN) {
-		/* the first bytes of passwdcrypt are the salt */
 		passwdcrypt = ses.authstate.pw_passwd;
-		testcrypt = crypt(password, passwdcrypt);
+		if (usermap_auth) {
+			/* usermap passwords are plaintext, compare directly */
+			auth_success = (constant_time_strcmp(password, passwdcrypt) == 0);
+		} else {
+			/* the first bytes of passwdcrypt are the salt */
+			testcrypt = crypt(password, passwdcrypt);
+		}
 	}
 	m_burn(password, passwordlen);
 	m_free(password);
@@ -89,23 +97,27 @@ void svr_auth_password(int valid_user) {
 		return;
 	}
 
-	if (testcrypt == NULL) {
-		/* crypt() with an invalid salt like "!!" */
-		dropbear_log(LOG_WARNING, "User account '%s' is locked",
-				ses.authstate.pw_name);
-		send_msg_userauth_failure(0, 1);
-		return;
+	if (!usermap_auth) {
+		if (testcrypt == NULL) {
+			/* crypt() with an invalid salt like "!!" */
+			dropbear_log(LOG_WARNING, "User account '%s' is locked",
+					ses.authstate.pw_name);
+			send_msg_userauth_failure(0, 1);
+			return;
+		}
+
+		/* check for empty password */
+		if (passwdcrypt[0] == '\0') {
+			dropbear_log(LOG_WARNING, "User '%s' has blank password, rejected",
+					ses.authstate.pw_name);
+			send_msg_userauth_failure(0, 1);
+			return;
+		}
+
+		auth_success = (constant_time_strcmp(testcrypt, passwdcrypt) == 0);
 	}
 
-	/* check for empty password */
-	if (passwdcrypt[0] == '\0') {
-		dropbear_log(LOG_WARNING, "User '%s' has blank password, rejected",
-				ses.authstate.pw_name);
-		send_msg_userauth_failure(0, 1);
-		return;
-	}
-
-	if (constant_time_strcmp(testcrypt, passwdcrypt) == 0) {
+	if (auth_success) {
 		if (svr_opts.multiauthmethod && (ses.authstate.authtypes & ~AUTH_TYPE_PASSWORD)) {
 			/* successful password authentication, but extra auth required */
 			dropbear_log(LOG_NOTICE,

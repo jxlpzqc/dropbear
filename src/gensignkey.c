@@ -48,21 +48,17 @@ int signkey_generate_get_bits(enum signkey_type keytype, int bits) {
 	return bits;
 }
 
-/* if skip_exist is set it will silently return if the key file exists */
-int signkey_generate(enum signkey_type keytype, int bits, const char* filename, int skip_exist)
+/* Generates a key of the given type directly into *key (in memory), never
+ * touching the filesystem. *key must be a fresh new_sign_key().
+ * Returns the resolved key type (an ECDSA "KEYGEN" type is resolved to the
+ * specific nistp size), or DROPBEAR_SIGNKEY_NONE on failure. */
+enum signkey_type signkey_generate_in_mem(enum signkey_type keytype, sign_key *key)
 {
-	sign_key * key = NULL;
-	buffer *buf = NULL;
-	char *fn_temp = NULL;
-	int ret = DROPBEAR_FAILURE;
-	bits = signkey_generate_get_bits(keytype, bits);
-
-	/* now we can generate the key */
-	key = new_sign_key();
+	int bits = signkey_generate_get_bits(keytype, 0);
 
 	seedrandom();
 
-	switch(keytype) {
+	switch (keytype) {
 #if DROPBEAR_RSA
 		case DROPBEAR_SIGNKEY_RSA:
 			key->rsakey = gen_rsa_priv_key(bits);
@@ -91,12 +87,32 @@ int signkey_generate(enum signkey_type keytype, int bits, const char* filename, 
 			break;
 #endif
 		default:
-			dropbear_exit("Internal error");
+			return DROPBEAR_SIGNKEY_NONE;
 	}
 
 	seedrandom();
 
-	buf = buf_new(MAX_PRIVKEY_SIZE); 
+	return keytype;
+}
+
+/* if skip_exist is set it will silently return if the key file exists */
+int signkey_generate(enum signkey_type keytype, int bits, const char* filename, int skip_exist)
+{
+	sign_key * key = NULL;
+	buffer *buf = NULL;
+	char *fn_temp = NULL;
+	int ret = DROPBEAR_FAILURE;
+	bits = signkey_generate_get_bits(keytype, bits);
+
+	/* now we can generate the key */
+	key = new_sign_key();
+
+	keytype = signkey_generate_in_mem(keytype, key);
+	if (keytype == DROPBEAR_SIGNKEY_NONE) {
+		dropbear_exit("Internal error");
+	}
+
+	buf = buf_new(MAX_PRIVKEY_SIZE);
 
 	buf_put_priv_key(buf, key, keytype);
 	sign_key_free(key);

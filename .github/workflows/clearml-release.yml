@@ -98,6 +98,10 @@ jobs:
             Static Dropbear build, for use inside non-root docker containers to gain remote SSH access.
             Set environment DROPBEAR_CLEARML_FIXED_PASSWORD=password to allow fixed user (i.e. dropbear process user) with fixed password login via SSH.
 
+            Additional options:
+            - `--user-map <user:@uid_or_username:password>` - map a login user to a system uid/username with a fixed password (repeatable, or via `--user-map-file`)
+            - `--memory-host-key[=startup|first]` - generate host keys in memory, never writing them to disk ('startup' at startup, 'first' on the first connection)
+
             Set environment SFTPSERVER_PATH=/dropbear/sftp-server to enable sftp support
 
             Supported platforms: linux/amd64 (x86-64), linux/arm64/v8 (aarch64)

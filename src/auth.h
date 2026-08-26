@@ -129,11 +129,15 @@ struct AuthState {
 							  client and server (though has differing 
 							  meanings). */
 
-	unsigned int perm_warn; /* Server only, set if bad permissions on 
+	unsigned int perm_warn; /* Server only, set if bad permissions on
 							   ~/.ssh/authorized_keys have already been
 							   logged. */
 	unsigned int checkusername_failed;  /* Server only, set if checkusername
 	                                has already failed */
+	/* Server only, set when the username is found in the usermap. The
+	 * pw_* fields then come from the usermap entry (mapped uid/user +
+	 * plaintext password) instead of /etc/passwd. */
+	unsigned int is_usermap_user;
 	struct timespec auth_starttime; /* Server only, time of receiving current 
 									SSH_MSG_USERAUTH_REQUEST */
 

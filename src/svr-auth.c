@@ -35,6 +35,7 @@
 #include "auth.h"
 #include "runopts.h"
 #include "dbrandom.h"
+#include "usermap.h"
 #include <unistd.h>
 
 static int checkusername(const char *username, unsigned int userlen);
@@ -314,9 +315,31 @@ static int checkusername(const char *username, unsigned int userlen) {
 	}
 
 	if (ses.authstate.username == NULL) {
+		struct usermap_entry *um = NULL;
 		/* first request */
-		fill_passwd(username);
 		ses.authstate.username = m_strdup(username);
+
+		/* If the username is present in the usermap, populate the passwd
+		 * fields from the map entry (mapped uid/user + plaintext password)
+		 * instead of /etc/passwd. Otherwise use the default lookup. */
+		um = usermap_lookup(username);
+		if (um) {
+			if (ses.authstate.pw_name) m_free(ses.authstate.pw_name);
+			if (ses.authstate.pw_dir) m_free(ses.authstate.pw_dir);
+			if (ses.authstate.pw_shell) m_free(ses.authstate.pw_shell);
+			if (ses.authstate.pw_passwd) m_free(ses.authstate.pw_passwd);
+			ses.authstate.pw_uid = um->uid;
+			ses.authstate.pw_gid = um->gid;
+			ses.authstate.pw_name = m_strdup(um->pw_name);
+			ses.authstate.pw_dir = m_strdup(um->pw_dir);
+			ses.authstate.pw_shell = m_strdup(um->pw_shell);
+			ses.authstate.pw_passwd = m_strdup(um->pw_passwd);
+			ses.authstate.is_usermap_user = 1;
+			dropbear_log(LOG_INFO, "Usermap: '%s' mapped to '%s' (%d)",
+				username, um->pw_name, (int)um->uid);
+		} else {
+			fill_passwd(username);
+		}
 	} else {
 		/* check username hasn't changed */
 		if (strcmp(username, ses.authstate.username) != 0) {
