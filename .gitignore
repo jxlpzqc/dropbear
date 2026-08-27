@@ -32,3 +32,4 @@ tags
 /test/fakekey
 .vscode/
 /build/
+/dropbear-data/
