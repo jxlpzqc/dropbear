@@ -81,19 +81,31 @@ void usermap_add(const char *spec) {
 			dropbear_exit("Bad usermap target '%s'", target);
 		}
 		pw = getpwuid((uid_t)uid);
-		if (!pw) {
-			dropbear_exit("usermap target uid %u does not exist", uid);
-		}
 	}
 
 	entry = m_malloc(sizeof(*entry));
 	memset(entry, 0, sizeof(*entry));
 	entry->login_name = m_strdup(login);
-	entry->uid = pw->pw_uid;
-	entry->gid = pw->pw_gid;
-	entry->pw_name = m_strdup(pw->pw_name);
-	entry->pw_dir = m_strdup(pw->pw_dir);
-	entry->pw_shell = m_strdup(pw->pw_shell);
+	if (pw) {
+		/* the usual case: the target has a /etc/passwd entry */
+		entry->uid = pw->pw_uid;
+		entry->gid = pw->pw_gid;
+		entry->pw_name = m_strdup(pw->pw_name);
+		entry->pw_dir = m_strdup(pw->pw_dir);
+		entry->pw_shell = m_strdup(pw->pw_shell);
+	} else {
+		/* No passwd entry for a numeric uid (e.g. docker --user <uid> in a
+		 * container without the user in /etc/passwd). Synthesize a minimal
+		 * entry so the login still runs as that uid. */
+		if (target[0] == '@') {
+			dropbear_exit("usermap target user '%s' does not exist", target + 1);
+		}
+		entry->uid = (uid_t)uid;
+		entry->gid = getgid();
+		entry->pw_name = m_strdup(login);
+		entry->pw_dir = m_strdup("/");
+		entry->pw_shell = m_strdup("/bin/sh");
+	}
 	entry->pw_passwd = m_strdup(password);
 	entry->next = NULL;
 

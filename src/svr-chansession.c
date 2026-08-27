@@ -278,10 +278,19 @@ static int newchansess(struct Channel *channel) {
 
 }
 
-static struct logininfo* 
+static struct logininfo*
 chansess_login_alloc(const struct ChanSess *chansess) {
 	struct logininfo * li;
-	li = login_alloc_entry(chansess->pid, ses.authstate.username,
+	/* Use pw_name, not the client-presented username: for usermap logins the
+	 * username may not exist in /etc/passwd, while pw_name is the system user
+	 * the session runs as (and equals username for regular logins). If even
+	 * pw_name has no passwd entry (uid-only containers), pass NULL so
+	 * login_init_entry skips the lookup instead of aborting. */
+	const char *name = ses.authstate.pw_name;
+	if (name != NULL && getpwnam(name) == NULL) {
+		name = NULL;
+	}
+	li = login_alloc_entry(chansess->pid, name,
 			svr_ses.remotehost, chansess->tty);
 	return li;
 }
@@ -593,6 +602,7 @@ static int sessionpty(struct ChanSess * chansess) {
 	unsigned int termlen;
 	char namebuf[65];
 	struct passwd * pw = NULL;
+	struct passwd pw_synth;
 
 	TRACE(("enter sessionpty"))
 
@@ -623,8 +633,14 @@ static int sessionpty(struct ChanSess * chansess) {
 	}
 
 	pw = getpwnam(ses.authstate.pw_name);
-	if (!pw)
-		dropbear_exit("getpwnam failed after succeeding previously");
+	if (!pw) {
+		/* uid-only containers: no passwd entry, but we already know the
+		 * uid/gid the session runs as */
+		memset(&pw_synth, 0, sizeof(pw_synth));
+		pw_synth.pw_uid = ses.authstate.pw_uid;
+		pw_synth.pw_gid = ses.authstate.pw_gid;
+		pw = &pw_synth;
+	}
 	pty_setowner(pw, chansess->tty);
 
 	/* Set up the rows/col counts */
