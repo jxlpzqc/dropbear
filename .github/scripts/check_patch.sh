@@ -41,6 +41,7 @@ clearml_files=(
 	src/runopts.h
 	src/svr-auth.c
 	src/svr-authpasswd.c
+	src/svr-authpubkey.c
 	src/svr-chansession.c
 	src/svr-kex.c
 	src/svr-main.c

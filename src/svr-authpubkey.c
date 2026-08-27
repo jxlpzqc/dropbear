@@ -576,10 +576,19 @@ out:
  * When this path is inside the user's home dir it checks up to and including
  * the home dir, otherwise it checks every path component. */
 static int checkpubkeyperms() {
-	char *path = authorized_keys_filepath(), *sep = NULL;
+	char *path, *sep = NULL;
 	int ret = DROPBEAR_SUCCESS;
 
 	TRACE(("enter checkpubkeyperms"))
+
+	/* Allow skipping the permission checks entirely, e.g. in containers where
+	 * the authorized_keys file lives on a volume owned by a different uid. */
+	if (getenv("DROPBEAR_SKIP_CHECK_PUBKEY_PERMS") != NULL) {
+		TRACE(("checkpubkeyperms: skipping perms checks (env set)"))
+		return DROPBEAR_SUCCESS;
+	}
+
+	path = authorized_keys_filepath();
 
 	/* Walk back up path checking permissions, stopping at either homedir,
 	 * or root if the path is outside of the homedir. */
